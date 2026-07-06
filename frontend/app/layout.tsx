@@ -1,11 +1,9 @@
 import type { Metadata } from "next";
 import "./globals.css";
 
-import { AppHeader } from "@/components/app-header";
-
 export const metadata: Metadata = {
-  title: "WhatsApp+",
-  description: "Chat, groups, attachments, status, and a live terminal",
+  title: "Web App",
+  description: "Next.js 16 + FastAPI + Supabase",
 };
 
 export default function RootLayout({
@@ -14,7 +12,6 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className="min-h-screen bg-background text-foreground antialiased">
-        <AppHeader />
         {children}
       </body>
     </html>

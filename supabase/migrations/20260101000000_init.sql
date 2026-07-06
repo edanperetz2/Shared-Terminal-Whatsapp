@@ -1,7 +1,18 @@
--- Initial migration. Canonical source of truth for the database schema —
--- mirror any change into frontend/lib/db/schema.ts (or regenerate it with
--- `npm run db:pull`).
---
--- The WhatsApp+ schema is introduced incrementally, one phase per migration,
--- starting with `profiles` in Phase 1. This file intentionally creates no
--- tables so the bootstrap database is clean.
+-- Initial schema. Canonical source of truth — mirror any change into
+-- frontend/lib/db/schema.ts (or regenerate it with `npm run db:pull`).
+
+create table if not exists public.todos (
+  id uuid primary key default gen_random_uuid(),
+  title text not null,
+  completed boolean not null default false,
+  inserted_at timestamptz not null default now()
+);
+
+-- RLS on from day one: without policies a table is inaccessible through the
+-- Supabase (PostgREST) client; the direct DATABASE_URL connection used by
+-- server code bypasses RLS.
+alter table public.todos enable row level security;
+
+create policy "todos are readable by everyone"
+  on public.todos for select
+  using (true);

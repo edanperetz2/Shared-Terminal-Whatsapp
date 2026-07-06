@@ -1,86 +1,94 @@
 "use client";
 
-import "@xterm/xterm/css/xterm.css";
+// The black terminal screen. It is docked at the BOTTOM of the open chat (it does
+// not cover the messages). Draws an xterm screen and connects to the backend's
+// shared shell over a WebSocket: your keystrokes go to the shell, and everything
+// the shell prints (including what other people type) shows up here.
 
 import { useEffect, useRef } from "react";
+import "@xterm/xterm/css/xterm.css";
+import { WS_BASE } from "@/lib/api";
 
-import { createClient } from "@/lib/supabase/client";
-
-// Mounts an xterm.js terminal and bridges it to the FastAPI PTY WebSocket.
-export function TerminalView({ terminalId }: { terminalId: string }) {
+export function TerminalView({
+  terminalId,
+  name,
+  onClose,
+}: {
+  terminalId: string;
+  name: string;
+  onClose: () => void;
+}) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    let cleanup: (() => void) | undefined;
     let disposed = false;
+    let term: import("@xterm/xterm").Terminal | undefined;
+    let ws: WebSocket | undefined;
+    let onResize: (() => void) | undefined;
 
     (async () => {
+      // Load xterm only in the browser (it needs the DOM to draw).
       const { Terminal } = await import("@xterm/xterm");
       const { FitAddon } = await import("@xterm/addon-fit");
       if (disposed || !containerRef.current) return;
 
-      const term = new Terminal({
-        convertEol: true,
+      term = new Terminal({
         cursorBlink: true,
         fontSize: 13,
-        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-        theme: { background: "#0b0b0b" },
+        theme: { background: "#0b141a" },
       });
       const fit = new FitAddon();
       term.loadAddon(fit);
       term.open(containerRef.current);
       fit.fit();
 
-      const {
-        data: { session },
-      } = await createClient().auth.getSession();
-      const token = session?.access_token ?? "";
-      const base =
-        process.env.NEXT_PUBLIC_BACKEND_WS_URL ?? "ws://localhost:8080";
-      const ws = new WebSocket(
-        `${base}/ws/terminal/${terminalId}?token=${encodeURIComponent(token)}`,
-      );
+      ws = new WebSocket(`${WS_BASE}/ws/terminal/${terminalId}`);
+      ws.onopen = () =>
+        ws?.send(JSON.stringify({ type: "resize", cols: term!.cols, rows: term!.rows }));
+      ws.onmessage = (e) => term?.write(e.data);
+      ws.onclose = () => term?.write("\r\n\x1b[31m[disconnected]\x1b[0m\r\n");
 
-      const sendResize = () => {
-        fit.fit();
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(
-            JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }),
-          );
-        }
-      };
-
-      ws.onopen = () => sendResize();
-      ws.onmessage = (e) => term.write(e.data as string);
-      ws.onclose = () => term.writeln("\r\n\x1b[31m*** disconnected ***\x1b[0m");
-      ws.onerror = () =>
-        term.writeln("\r\n\x1b[31m*** connection error ***\x1b[0m");
-
-      const dataSub = term.onData((d) => {
-        if (ws.readyState === WebSocket.OPEN) {
+      // Send my keystrokes to the shared shell.
+      term.onData((d) => {
+        if (ws && ws.readyState === WebSocket.OPEN)
           ws.send(JSON.stringify({ type: "input", data: d }));
-        }
       });
-      window.addEventListener("resize", sendResize);
 
-      cleanup = () => {
-        window.removeEventListener("resize", sendResize);
-        dataSub.dispose();
-        ws.close();
-        term.dispose();
+      onResize = () => {
+        try {
+          fit.fit();
+          if (ws && ws.readyState === WebSocket.OPEN)
+            ws.send(JSON.stringify({ type: "resize", cols: term!.cols, rows: term!.rows }));
+        } catch {}
       };
+      window.addEventListener("resize", onResize);
     })();
 
     return () => {
       disposed = true;
-      cleanup?.();
+      if (onResize) window.removeEventListener("resize", onResize);
+      try {
+        ws?.close();
+      } catch {}
+      try {
+        term?.dispose();
+      } catch {}
     };
   }, [terminalId]);
 
   return (
-    <div
-      ref={containerRef}
-      className="h-[70vh] w-full overflow-hidden rounded-md border bg-[#0b0b0b] p-2"
-    />
+    <div className="flex h-72 shrink-0 flex-col border-t bg-[#0b141a]">
+      <div className="flex items-center justify-between bg-zinc-900 px-4 py-2 text-sm text-white">
+        <span>🖥️ {name} — shared terminal (everyone here can type)</span>
+        <button
+          onClick={onClose}
+          className="rounded px-2 py-0.5 hover:bg-zinc-700"
+          aria-label="Close terminal"
+        >
+          ✕
+        </button>
+      </div>
+      <div ref={containerRef} className="min-h-0 flex-1 p-2" />
+    </div>
   );
 }
