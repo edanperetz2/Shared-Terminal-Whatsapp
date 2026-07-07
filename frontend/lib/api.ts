@@ -1,82 +1,142 @@
-// Small client-side helper: knows "who am I" (from the ?me= URL) and wraps the
-// backend calls so the UI code stays short. No auth — identity is just the URL.
+// Typed client for the FastAPI backend. Always uses relative /api/* paths (the
+// Next rewrite proxies them to the backend), and attaches the JWT from
+// localStorage as a Bearer token.
 
-export type User = { id: string; displayName: string; color: string };
-export type Conversation = {
+export type User = {
   id: string;
-  type: "dm" | "group";
-  title: string;
-  memberIds: string[];
-  lastMessage: string;
-  lastAtMs: number;
+  username: string;
+  created_at: string;
+  // Present on contacts (GET /api/users); absent on the auth'd self.
+  online?: boolean;
+  last_seen?: string | null;
 };
-export type Attachment =
-  | { kind: "photo"; dataUrl: string }
-  | { kind: "terminal"; terminalId: string; name: string };
+export type Member = { id: string; username: string };
+export type Group = {
+  id: string;
+  name: string;
+  created_by: string;
+  created_at: string;
+  members: Member[];
+};
+export type Attachment = {
+  id: string;
+  filename: string;
+  mime_type: string;
+  size_bytes: number;
+};
 export type Message = {
   id: string;
-  conversationId: string;
-  senderId: string;
+  sender_id: string;
+  sender_username: string;
+  group_id: string | null;
+  recipient_id: string | null;
   body: string | null;
   attachment: Attachment | null;
-  createdAtMs: number;
+  created_at: string;
 };
+export type AuthResponse = { token: string; user: User };
 
-// The live terminal connects straight to the backend (WebSockets skip the proxy).
-// Use 127.0.0.1 (IPv4), not "localhost": on Windows "localhost" may resolve to
-// IPv6 (::1) where the backend isn't listening, so the terminal would silently fail.
-export const WS_BASE = "ws://127.0.0.1:8080";
+const TOKEN_KEY = "auth_token";
 
-export function getMe(): string {
-  if (typeof window === "undefined") return "alice";
-  return new URLSearchParams(window.location.search).get("me") || "alice";
+export function getToken(): string | null {
+  if (typeof window === "undefined") return null;
+  return localStorage.getItem(TOKEN_KEY);
 }
 
-async function jget(path: string) {
-  const r = await fetch(path);
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+export function setToken(token: string | null): void {
+  if (typeof window === "undefined") return;
+  if (token) localStorage.setItem(TOKEN_KEY, token);
+  else localStorage.removeItem(TOKEN_KEY);
 }
-async function jpost(path: string, body: unknown) {
-  const r = await fetch(path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+
+export class ApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+async function req<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...((options.headers as Record<string, string>) ?? {}),
+  };
+  const token = getToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  const res = await fetch(path, { ...options, headers });
+  if (!res.ok) {
+    let message = res.statusText;
+    try {
+      const data = await res.json();
+      const detail = data?.detail;
+      if (typeof detail === "string") message = detail;
+      else if (Array.isArray(detail)) message = detail.map((d) => d?.msg ?? "").join(", ");
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new ApiError(res.status, message);
+  }
+  if (res.status === 204) return null as T;
+  return (await res.json()) as T;
 }
 
 export const api = {
-  users: (): Promise<User[]> => jget("/api/users"),
-  conversations: (me: string): Promise<Conversation[]> =>
-    jget(`/api/conversations?me=${me}`),
-  createDm: (me: string, peerUserId: string): Promise<{ id: string }> =>
-    jpost("/api/conversations", { me, peerUserId }),
-  createGroup: (
-    me: string,
-    name: string,
-    memberIds: string[],
-  ): Promise<{ id: string }> => jpost("/api/groups", { me, name, memberIds }),
-  messages: (conversationId: string, after: number): Promise<Message[]> =>
-    jget(`/api/messages?conversationId=${conversationId}&after=${after}`),
-  sendMessage: (payload: {
-    me: string;
-    conversationId: string;
-    body?: string | null;
-    attachment?: Attachment | null;
-  }): Promise<Message> => jpost("/api/messages", payload),
-  setTyping: (me: string, conversationId: string) =>
-    jpost("/api/typing", { me, conversationId }),
-  getTyping: (
-    conversationId: string,
-    me: string,
-  ): Promise<{ userId: string; displayName: string }[]> =>
-    jget(`/api/typing?conversationId=${conversationId}&me=${me}`),
-  createTerminal: (
-    me: string,
-    name: string,
-    conversationId: string,
-  ): Promise<{ id: string; name: string; isNew: boolean }> =>
-    jpost("/api/terminals", { me, name, conversationId }),
+  signup: (username: string, password: string) =>
+    req<AuthResponse>("/api/auth/signup", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }),
+  login: (username: string, password: string) =>
+    req<AuthResponse>("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }),
+  logout: () => req<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
+  me: () => req<User>("/api/auth/me"),
+
+  users: () => req<User[]>("/api/users"),
+
+  groups: () => req<Group[]>("/api/groups"),
+  createGroup: (name: string, member_ids: string[]) =>
+    req<Group>("/api/groups", {
+      method: "POST",
+      body: JSON.stringify({ name, member_ids }),
+    }),
+
+  dmMessages: (otherId: string) => req<Message[]>(`/api/messages/dm/${otherId}`),
+  sendDm: (otherId: string, body: string | null, attachmentId?: string | null) =>
+    req<Message>(`/api/messages/dm/${otherId}`, {
+      method: "POST",
+      body: JSON.stringify({ body: body || null, attachment_id: attachmentId ?? null }),
+    }),
+  groupMessages: (groupId: string) => req<Message[]>(`/api/messages/group/${groupId}`),
+  sendGroup: (groupId: string, body: string | null, attachmentId?: string | null) =>
+    req<Message>(`/api/messages/group/${groupId}`, {
+      method: "POST",
+      body: JSON.stringify({ body: body || null, attachment_id: attachmentId ?? null }),
+    }),
+
+  uploadImage: async (file: File): Promise<Attachment> => {
+    const fd = new FormData();
+    fd.append("file", file);
+    const token = getToken();
+    const res = await fetch("/api/attachments", {
+      method: "POST",
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: fd,
+    });
+    if (!res.ok) {
+      let message = res.statusText;
+      try {
+        const d = await res.json();
+        if (typeof d?.detail === "string") message = d.detail;
+      } catch {
+        /* ignore */
+      }
+      throw new ApiError(res.status, message);
+    }
+    return (await res.json()) as Attachment;
+  },
 };

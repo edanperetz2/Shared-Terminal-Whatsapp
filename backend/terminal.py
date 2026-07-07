@@ -1,107 +1,206 @@
-"""Shared terminal: one real PowerShell per terminal id, streamed to everyone.
+"""Live shared terminal — one shell process per group, mirrored to every
+connected group member.
 
-A "PTY" (pseudo-terminal) is a real shell the backend drives. For each terminal
-id we spawn one PowerShell and keep a set of connected browsers. Whatever the
-shell prints is broadcast to all of them; anything any of them types is written
-back into the shell — so everyone shares one live session and all can type.
+WS protocol (JSON frames):
+  client -> server: {"type":"input","data":"..."} | {"type":"resize","rows":R,"cols":C}
+  server -> client: {"type":"output","data":"..."} | {"type":"exit"}
+
+A blocking OS pseudo-terminal is read on a background thread; output is pushed
+onto the event loop and fanned out to all sockets. The session is created
+lazily on first connect and killed when the last member disconnects. A small
+scrollback buffer is replayed to late joiners so everyone sees the same screen.
 """
 
 import asyncio
 import json
+import os
+import sys
 import threading
-from typing import Optional
 
-from fastapi import WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    Query,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 
-try:
-    from winpty import PtyProcess  # from the pywinpty package (Windows)
+from messaging import _is_member
+from security import decode_token, user_from_id
 
-    _HAVE_PTY = True
-except Exception:  # pragma: no cover - only if pywinpty missing
-    PtyProcess = None
-    _HAVE_PTY = False
+IS_WINDOWS = sys.platform == "win32"
+_SCROLLBACK = 20000  # chars of recent output replayed to new members
 
-RING_MAX = 16000  # chars of recent output replayed to someone who joins late
+
+class PtyBackend:
+    """OS pseudo-terminal running an interactive shell (winpty / posix pty)."""
+
+    def __init__(self, rows: int = 24, cols: int = 80) -> None:
+        if IS_WINDOWS:
+            import winpty
+
+            shell = os.environ.get("COMSPEC", "cmd.exe")
+            self._p = winpty.PtyProcess.spawn(shell, dimensions=(rows, cols))
+        else:
+            import pty
+            import subprocess
+
+            self._master, slave = pty.openpty()
+            shell = os.environ.get("SHELL", "/bin/bash")
+            self._proc = subprocess.Popen(
+                [shell],
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                preexec_fn=os.setsid,
+                close_fds=True,
+            )
+            os.close(slave)
+
+    def read(self) -> str:
+        """Block until output is available; return "" on EOF/exit."""
+        if IS_WINDOWS:
+            try:
+                return self._p.read(1024)
+            except EOFError:
+                return ""
+        try:
+            return os.read(self._master, 1024).decode(errors="replace")
+        except OSError:
+            return ""
+
+    def write(self, data: str) -> None:
+        try:
+            if IS_WINDOWS:
+                self._p.write(data)
+            else:
+                os.write(self._master, data.encode())
+        except (OSError, EOFError):
+            pass
+
+    def resize(self, rows: int, cols: int) -> None:
+        try:
+            if IS_WINDOWS:
+                self._p.setwinsize(rows, cols)
+            else:
+                import fcntl
+                import struct
+                import termios
+
+                fcntl.ioctl(
+                    self._master,
+                    termios.TIOCSWINSZ,
+                    struct.pack("HHHH", rows, cols, 0, 0),
+                )
+        except Exception:
+            pass
+
+    def alive(self) -> bool:
+        if IS_WINDOWS:
+            return self._p.isalive()
+        return self._proc.poll() is None
+
+    def kill(self) -> None:
+        try:
+            if IS_WINDOWS:
+                self._p.terminate(force=True)
+            else:
+                self._proc.terminate()
+        except Exception:
+            pass
 
 
 class TerminalSession:
-    def __init__(self, terminal_id: str) -> None:
-        self.id = terminal_id
-        self.proc = None
-        self.clients: set[WebSocket] = set()
-        self.buffer = ""  # recent output ("last screenful") for late joiners
-        self.loop: Optional[asyncio.AbstractEventLoop] = None
-
-    def ensure_started(self, loop: asyncio.AbstractEventLoop) -> None:
-        if self.proc is not None:
-            return
+    def __init__(self, group_id: str, loop: asyncio.AbstractEventLoop) -> None:
+        self.group_id = group_id
         self.loop = loop
-        self.proc = PtyProcess.spawn(["powershell.exe", "-NoLogo"])
-        threading.Thread(target=self._read_loop, daemon=True).start()
+        self.pty = PtyBackend()
+        self.clients: set[WebSocket] = set()
+        self.buffer = ""
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
 
     def _read_loop(self) -> None:
         while True:
-            try:
-                data = self.proc.read(4096)
-            except Exception:
+            data = self.pty.read()
+            if data == "":
+                asyncio.run_coroutine_threadsafe(self._fanout({"type": "exit"}), self.loop)
                 break
-            if not data:
-                break
-            self.buffer = (self.buffer + data)[-RING_MAX:]
-            if self.loop:
-                asyncio.run_coroutine_threadsafe(self._broadcast(data), self.loop)
+            self.buffer = (self.buffer + data)[-_SCROLLBACK:]
+            asyncio.run_coroutine_threadsafe(
+                self._fanout({"type": "output", "data": data}), self.loop
+            )
 
-    async def _broadcast(self, data: str) -> None:
+    async def _fanout(self, payload: dict) -> None:
         for ws in list(self.clients):
             try:
-                await ws.send_text(data)
+                await ws.send_json(payload)
             except Exception:
-                self.clients.discard(ws)
+                pass
+
+    async def send_backlog(self, ws: WebSocket) -> None:
+        if self.buffer:
+            await ws.send_json({"type": "output", "data": self.buffer})
+
+    def add(self, ws: WebSocket) -> None:
+        self.clients.add(ws)
+
+    def remove(self, ws: WebSocket) -> None:
+        self.clients.discard(ws)
+
+    def empty(self) -> bool:
+        return not self.clients
 
 
-SESSIONS: dict[str, TerminalSession] = {}
+class TerminalManager:
+    def __init__(self) -> None:
+        self.sessions: dict[str, TerminalSession] = {}
+        self._lock = threading.Lock()
+
+    def get_or_create(self, group_id: str, loop: asyncio.AbstractEventLoop) -> TerminalSession:
+        with self._lock:
+            sess = self.sessions.get(group_id)
+            if sess is None or not sess.pty.alive():
+                sess = TerminalSession(group_id, loop)
+                self.sessions[group_id] = sess
+            return sess
+
+    def close(self, group_id: str) -> None:
+        with self._lock:
+            sess = self.sessions.pop(group_id, None)
+        if sess:
+            sess.pty.kill()
 
 
-def register_terminal(terminal_id: str) -> None:
-    """Called when a terminal is created; the shell itself starts on first open."""
-    SESSIONS.setdefault(terminal_id, TerminalSession(terminal_id))
+terminals = TerminalManager()
+
+router = APIRouter(prefix="/api", tags=["terminal"])
 
 
-async def terminal_websocket(websocket: WebSocket, terminal_id: str) -> None:
-    await websocket.accept()
-    if not _HAVE_PTY:
-        await websocket.send_text("\r\n[terminal unavailable: pywinpty not installed]\r\n")
-        await websocket.close()
+@router.websocket("/ws/terminal/{group_id}")
+async def ws_terminal(ws: WebSocket, group_id: str, token: str = Query(...)):
+    user_id = decode_token(token)
+    if user_id is None or user_from_id(user_id) is None:
+        await ws.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    if not _is_member(group_id, user_id):
+        await ws.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
-    session = SESSIONS.setdefault(terminal_id, TerminalSession(terminal_id))
-    try:
-        session.ensure_started(asyncio.get_running_loop())
-    except Exception as exc:
-        await websocket.send_text(f"\r\n[failed to start shell: {exc}]\r\n")
-        await websocket.close()
-        return
-
-    session.clients.add(websocket)
-    if session.buffer:  # replay recent output to a late joiner
-        await websocket.send_text(session.buffer)
-
+    await ws.accept()
+    sess = terminals.get_or_create(group_id, asyncio.get_running_loop())
+    sess.add(ws)
+    await sess.send_backlog(ws)
     try:
         while True:
-            raw = await websocket.receive_text()
-            try:
-                msg = json.loads(raw)
-            except Exception:
-                session.proc.write(raw)
-                continue
+            msg = json.loads(await ws.receive_text())
             if msg.get("type") == "input":
-                session.proc.write(msg.get("data", ""))
+                sess.pty.write(msg.get("data", ""))
             elif msg.get("type") == "resize":
-                try:
-                    session.proc.setwinsize(int(msg.get("rows", 24)), int(msg.get("cols", 80)))
-                except Exception:
-                    pass
+                sess.pty.resize(int(msg.get("rows", 24)), int(msg.get("cols", 80)))
     except WebSocketDisconnect:
         pass
     finally:
-        session.clients.discard(websocket)
+        sess.remove(ws)
+        if sess.empty():
+            terminals.close(group_id)
