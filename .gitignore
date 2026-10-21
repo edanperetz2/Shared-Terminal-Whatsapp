@@ -24,3 +24,7 @@ supabase/.branches/
 
 # uploaded attachments (stored on disk, indexed in DB)
 backend/uploads/
+
+# IDE
+.idea/
+.vscode/
